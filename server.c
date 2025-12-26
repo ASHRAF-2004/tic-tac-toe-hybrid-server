@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdbool.h>
 
 #define MAX_PLAYERS 5
 #define MIN_PLAYERS 3
@@ -60,6 +61,8 @@ typedef struct {
 static shared_state_t *state = NULL;
 static pid_t children[MAX_PLAYERS];
 static int child_count = 0;
+static volatile sig_atomic_t live_children = 0;
+static volatile sig_atomic_t shutdown_requested = 0;
 
 static void enqueue_log(const char *msg) {
     pthread_mutex_lock(&state->log_queue.mutex);
@@ -74,6 +77,8 @@ static void enqueue_log(const char *msg) {
     pthread_mutex_unlock(&state->log_queue.mutex);
 }
 
+static void save_scores();
+
 static void reset_board_locked() {
     state->moves_made = 0;
     for (int r = 0; r < BOARD_SIZE; r++) {
@@ -86,16 +91,27 @@ static void reset_board_locked() {
     state->turn_in_progress = 0;
 }
 
+static int active_player_count_locked() {
+    int count = 0;
+    for (int i = 0; i < state->player_count; i++) {
+        if (state->active_players[i]) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static void load_scores() {
     FILE *fp = fopen(SCORE_FILE, "r");
     if (!fp) {
-        // initialize with defaults
+        // initialize with defaults and create the file for persistence
         pthread_mutex_lock(&state->scores.mutex);
         for (int i = 0; i < state->player_count; i++) {
             snprintf(state->scores.entries[i].player_name, sizeof(state->scores.entries[i].player_name), "Player%d", i);
             state->scores.entries[i].score = 0;
         }
         pthread_mutex_unlock(&state->scores.mutex);
+        save_scores();
         return;
     }
     pthread_mutex_lock(&state->scores.mutex);
@@ -174,12 +190,14 @@ static void *logger_thread(void *arg) {
 
 static void *scheduler_thread(void *arg) {
     while (1) {
+        int persist_scores = 0;
         pthread_mutex_lock(&state->state_mutex);
         while (state->shutdown) {
             pthread_mutex_unlock(&state->state_mutex);
             return NULL;
         }
         if (!state->game_active) {
+            persist_scores = 1;
             reset_board_locked();
             enqueue_log("Scheduler: new game prepared");
         }
@@ -194,6 +212,10 @@ static void *scheduler_thread(void *arg) {
             pthread_cond_wait(&state->turn_done_cv, &state->state_mutex);
         }
         pthread_mutex_unlock(&state->state_mutex);
+        if (persist_scores) {
+            enqueue_log("Scheduler: persisting scores for completed round");
+            save_scores();
+        }
         if (state->shutdown)
             break;
     }
@@ -224,6 +246,22 @@ static void handle_sigint(int sig) {
     pthread_cond_broadcast(&state->log_queue.cond);
     pthread_mutex_unlock(&state->log_queue.mutex);
     save_scores();
+}
+
+static void sigchld_handler(int sig) {
+    (void)sig;
+    int saved_errno = errno;
+    int status = 0;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (live_children > 0) {
+            live_children--;
+        }
+    }
+    if (live_children <= 0) {
+        shutdown_requested = 1;
+    }
+    errno = saved_errno;
 }
 
 static void setup_shared_state(int player_count) {
@@ -325,7 +363,18 @@ static void handle_client(int player_id) {
             state->active_players[player_id] = 0;
             state->turn_in_progress = 0;
             pthread_cond_signal(&state->turn_done_cv);
+            if (active_player_count_locked() < MIN_PLAYERS) {
+                state->shutdown = 1;
+                enqueue_log("Shutting down: fewer than minimum active players");
+                pthread_cond_broadcast(&state->turn_cv);
+                pthread_cond_broadcast(&state->turn_done_cv);
+            }
             pthread_mutex_unlock(&state->state_mutex);
+            if (state->shutdown) {
+                pthread_mutex_lock(&state->log_queue.mutex);
+                pthread_cond_broadcast(&state->log_queue.cond);
+                pthread_mutex_unlock(&state->log_queue.mutex);
+            }
             break;
         }
         buffer[n] = '\0';
@@ -380,8 +429,19 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    live_children = player_count;
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa, NULL) < 0) {
+        perror("sigaction SIGCHLD");
+        return EXIT_FAILURE;
+    }
 
     setup_shared_state(player_count);
     cleanup_pipes();
@@ -418,13 +478,26 @@ int main(int argc, char *argv[]) {
         if (pid == 0) {
             handle_client(i);
         } else {
-            children[child_count++] = pid;
+            children[i] = pid;
+            child_count++;
         }
     }
 
-    int status;
-    while (!state->shutdown && wait(&status) > 0) {
-        // reap children
+    while (!state->shutdown) {
+        if (shutdown_requested && !state->shutdown) {
+            pthread_mutex_lock(&state->state_mutex);
+            state->shutdown = 1;
+            pthread_cond_broadcast(&state->turn_cv);
+            pthread_cond_broadcast(&state->turn_done_cv);
+            pthread_mutex_unlock(&state->state_mutex);
+            pthread_mutex_lock(&state->log_queue.mutex);
+            pthread_cond_broadcast(&state->log_queue.cond);
+            pthread_mutex_unlock(&state->log_queue.mutex);
+        }
+        if (state->shutdown) {
+            break;
+        }
+        pause();
     }
 
     pthread_join(scheduler_tid, NULL);
